@@ -6,18 +6,21 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"testing"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
-// buildBlob encodes plaintext in the vendor's chunked ChaCha20-Poly1305 format
-// with a single key chunk, which is the shape the decoder must read.
-func buildBlob(t *testing.T, plaintext []byte) []byte {
+// buildBlobWithSeed encodes plaintext in the vendor's chunked
+// ChaCha20-Poly1305 format with a single key chunk, which is the shape the
+// decoder must read. payloadSeed is written into the chunk table verbatim while
+// kdfSeed is the key material the AEAD key is derived from; the two differ when
+// the seed is a hex string that DecryptBlackstonePayload hex-decodes.
+func buildBlobWithSeed(t *testing.T, plaintext, payloadSeed, kdfSeed []byte) []byte {
 	t.Helper()
-	seed := []byte("00112233445566778899aabbccddeeff")
-	aead, err := chacha20poly1305.New(vmessKDF(seed, kdfLabel))
+	aead, err := chacha20poly1305.New(vmessKDF(kdfSeed, kdfLabel))
 	if err != nil {
 		t.Fatalf("chacha20poly1305: %v", err)
 	}
@@ -26,13 +29,32 @@ func buildBlob(t *testing.T, plaintext []byte) []byte {
 		t.Fatalf("nonce: %v", err)
 	}
 	ciphertext := append(nonce, aead.Seal(nil, nonce, plaintext, nil)...)
-	payload := append(append([]byte{}, seed...), ciphertext...)
+	payload := append(append([]byte{}, payloadSeed...), ciphertext...)
 	raw := make([]byte, 1+8+len(payload))
 	raw[0] = 1
 	binary.BigEndian.PutUint32(raw[1:5], 0)
-	binary.BigEndian.PutUint32(raw[5:9], uint32(len(seed)))
+	binary.BigEndian.PutUint32(raw[5:9], uint32(len(payloadSeed)))
 	copy(raw[9:], payload)
 	return raw
+}
+
+// buildBlob uses a non-hex seed, so the decoder takes its raw-seed path.
+func buildBlob(t *testing.T, plaintext []byte) []byte {
+	t.Helper()
+	seed := []byte("transport-secret")
+	return buildBlobWithSeed(t, plaintext, seed, seed)
+}
+
+// buildHexSeedBlob writes a hex-looking seed, which the decoder hex-decodes
+// before deriving the key.
+func buildHexSeedBlob(t *testing.T, plaintext []byte) []byte {
+	t.Helper()
+	payloadSeed := []byte("00112233445566778899aabbccddeeff")
+	rawSeed, err := hex.DecodeString(string(payloadSeed))
+	if err != nil {
+		t.Fatalf("hex seed: %v", err)
+	}
+	return buildBlobWithSeed(t, plaintext, payloadSeed, rawSeed)
 }
 
 func TestDecryptBlackstonePayload(t *testing.T) {
@@ -40,6 +62,17 @@ func TestDecryptBlackstonePayload(t *testing.T) {
 	got, err := DecryptBlackstonePayload(buildBlob(t, plaintext))
 	if err != nil {
 		t.Fatalf("decrypt: %v", err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatalf("decrypted = %q, want %q", got, plaintext)
+	}
+}
+
+func TestDecryptBlackstonePayloadHexSeed(t *testing.T) {
+	plaintext := []byte(`{"server":"203.0.113.9","port":443}`)
+	got, err := DecryptBlackstonePayload(buildHexSeedBlob(t, plaintext))
+	if err != nil {
+		t.Fatalf("decrypt with hex seed: %v", err)
 	}
 	if !bytes.Equal(got, plaintext) {
 		t.Fatalf("decrypted = %q, want %q", got, plaintext)
@@ -102,7 +135,9 @@ func TestDecodeConfigBlobRejectsOrdinaryPassword(t *testing.T) {
 	if LooksLikeConfigBlob("transport-secret:0011223344556677") {
 		t.Fatal("plain password looks like a blob")
 	}
-	corrupted := "v3\n" + base64.StdEncoding.EncodeToString([]byte{0x09, 0x01, 0x00})
+	// The body must survive DecodeConfigBlob's "too short to be a blob" guard
+	// (>= 8 base64 chars) so the corrupted chunk table is actually parsed.
+	corrupted := "v3\n" + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x09}, 16))
 	if _, isBlob, err := DecodeConfigBlob(corrupted); err == nil || !isBlob {
 		t.Fatalf("corrupted blob: isBlob=%v err=%v", isBlob, err)
 	}

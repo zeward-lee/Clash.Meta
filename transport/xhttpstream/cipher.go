@@ -115,11 +115,11 @@ func ListCipher() []string {
 // the fake-net header map.
 type StreamCipher struct {
 	Cipher
-	Key     []byte
-	token   []byte
-	hmac    []byte
+	Key      []byte
+	token    []byte
+	hmac     []byte
 	password string
-	fakeNet map[string]string
+	fakeNet  map[string]string
 
 	// mu guards the lazy HMAC assignment, mirroring the upstream SetHmac.
 	mu sync.Mutex

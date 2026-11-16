@@ -193,6 +193,12 @@ func TestReadRejectsForeignToken(t *testing.T) {
 		_, _ = rand.Read(prefix)
 		wrongToken := bytes.Repeat([]byte{0xaa}, 16)
 		_, _ = conn.Write(append(prefix, wrongToken...))
+		// Drain the client handshake before closing. Closing a socket that
+		// still holds unread inbound data makes Windows send an RST, which can
+		// purge the wrong token we just wrote and surface as "connection
+		// aborted" instead of ErrInvalidToken.
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, _ = io.Copy(io.Discard, conn)
 	}()
 
 	ciph := testCipher(t)
