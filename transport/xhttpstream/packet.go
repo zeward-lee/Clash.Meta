@@ -11,7 +11,7 @@ import (
 )
 
 // PacketConn is the plain (non UOT) UDP mode: one forged-and-encrypted frame
-// per datagram on a connected UDP socket.
+// per datagram on a UDP socket bound to the configured server.
 //
 // Frame layout, reconstructed from the vendor build's Pack/Unpack helpers:
 //
@@ -22,10 +22,16 @@ import (
 //	[IV]   random per-packet IV
 //	[..]   AES-CTR( SOCKS address || payload )
 //
+// The socket always talks to the server named by the node (server/port, or the
+// values inside its config blob); the SOCKS address inside the frame is the
+// per-datagram target the caller passes to WriteTo. remote is kept explicit so
+// RemoteAddr reports the configured server and never a metadata address.
+//
 // This path is not covered by a live test yet; see the report's 联调 list.
 type PacketConn struct {
 	net.Conn
 	Cipher
+	remote  net.Addr
 	token   []byte
 	hmac    []byte
 	fakeNet map[string]string
@@ -33,6 +39,9 @@ type PacketConn struct {
 	writeMu sync.Mutex
 	readMu  sync.Mutex
 }
+
+// RemoteAddr reports the configured xhttp server, not the datagram target.
+func (c *PacketConn) RemoteAddr() net.Addr { return c.remote }
 
 // WriteTo encrypts one datagram to addr.
 func (c *PacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
@@ -124,8 +133,14 @@ func (c *PacketConn) newIV() ([]byte, error) {
 // encodeSocksAddr serializes a net.Addr the way the vendor core serializes the
 // first destination of a stream.
 func encodeSocksAddr(addr net.Addr) ([]byte, error) {
+	if addr == nil {
+		return nil, errors.New("xhttp: missing UDP destination")
+	}
 	switch a := addr.(type) {
 	case *net.UDPAddr:
+		if a.IP == nil {
+			return nil, fmt.Errorf("xhttp: UDP address %s has no IP", a)
+		}
 		port := a.Port
 		if ip4 := a.IP.To4(); ip4 != nil {
 			return append(append([]byte{0x01}, ip4...), byte(port>>8), byte(port)), nil
@@ -134,7 +149,23 @@ func encodeSocksAddr(addr net.Addr) ([]byte, error) {
 	case *net.TCPAddr:
 		return encodeSocksAddr(&net.UDPAddr{IP: a.IP, Port: a.Port})
 	default:
-		return nil, fmt.Errorf("xhttp: unsupported UDP address %s", addr)
+		// A SOCKS domain destination (what the udp relay hands over when the
+		// target was never resolved) and any other host:port address.
+		host, portString, err := net.SplitHostPort(addr.String())
+		if err != nil {
+			return nil, fmt.Errorf("xhttp: unsupported UDP address %s", addr)
+		}
+		port, err := strconv.Atoi(portString)
+		if err != nil || port < 0 || port > 65535 {
+			return nil, fmt.Errorf("xhttp: bad UDP port in %s", addr)
+		}
+		if len(host) == 0 || len(host) > 255 {
+			return nil, fmt.Errorf("xhttp: bad UDP domain length in %s", addr)
+		}
+		encoded := make([]byte, 0, 2+len(host)+2)
+		encoded = append(encoded, 0x03, byte(len(host)))
+		encoded = append(encoded, host...)
+		return append(encoded, byte(port>>8), byte(port)), nil
 	}
 }
 

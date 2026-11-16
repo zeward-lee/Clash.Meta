@@ -204,11 +204,15 @@ func (c *StreamCipher) StreamConn(conn net.Conn, destination []byte) net.Conn {
 	}
 }
 
-// PacketConn wraps a datagram connection for the plain (non UOT) UDP mode.
-func (c *StreamCipher) PacketConn(conn net.Conn) net.PacketConn {
+// PacketConn wraps a datagram carrier for the plain (non UOT) UDP mode. The
+// carrier must already be bound to the configured server (server/port from the
+// node or its config blob); remote is kept so the conn reports it as
+// RemoteAddr, while the destination inside each frame stays per datagram.
+func (c *StreamCipher) PacketConn(conn net.Conn, remote net.Addr) net.PacketConn {
 	return &PacketConn{
 		Conn:    conn,
 		Cipher:  c,
+		remote:  remote,
 		token:   c.token,
 		hmac:    c.hmac,
 		fakeNet: c.fakeNet,

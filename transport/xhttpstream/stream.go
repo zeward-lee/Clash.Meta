@@ -7,10 +7,20 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
+	"time"
 )
 
-const bufSize = 2048
+const (
+	bufSize = 2048
+
+	// handshakeReadTimeout bounds the read of the server preamble, the echoed
+	// token and the read IV. The relay's own deadlines do not cover it until the
+	// reader is built, so a server that accepts the TCP connect and then goes
+	// silent would otherwise pin the first read forever.
+	handshakeReadTimeout = 10 * time.Second
+)
 
 // Writer is an encrypted io.Writer. It keeps one buffer so a plain Write does
 // not allocate, exactly like the shadowsocks stream writer the vendor forked.
@@ -43,6 +53,8 @@ func (w *Writer) Write(p []byte) (n int, err error) {
 }
 
 func (w *Writer) ReadFrom(r io.Reader) (n int64, err error) {
+	w.access.Lock()
+	defer w.access.Unlock()
 	buf := w.buf[:]
 	for {
 		nr, er := r.Read(buf)
@@ -62,10 +74,17 @@ func (w *Writer) ReadFrom(r io.Reader) (n int64, err error) {
 }
 
 // Reader is an encrypted io.Reader.
+//
+// The stream cipher is stateful, so Read and WriteTo (the io.WriterTo fast path
+// io.Copy uses) must not run concurrently: access serialises them. A caller that
+// shares a Conn between a reader and a writer goroutine therefore only ever
+// touches one cipher stream per direction.
 type Reader struct {
 	io.Reader
 	cipher.Stream
 	buf [bufSize]byte
+
+	access sync.Mutex
 }
 
 // NewReader wraps an io.Reader with stream cipher decryption.
@@ -74,6 +93,8 @@ func NewReader(r io.Reader, s cipher.Stream) *Reader {
 }
 
 func (r *Reader) Read(p []byte) (n int, err error) {
+	r.access.Lock()
+	defer r.access.Unlock()
 	n, err = r.Reader.Read(p)
 	if err != nil {
 		return 0, err
@@ -83,6 +104,8 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 }
 
 func (r *Reader) WriteTo(w io.Writer) (n int64, err error) {
+	r.access.Lock()
+	defer r.access.Unlock()
 	buf := r.buf[:]
 	for {
 		nr, er := r.Reader.Read(buf)
@@ -124,6 +147,10 @@ func (r *Reader) WriteTo(w io.Writer) (n int64, err error) {
 //	[N]    preamble bytes, not used by the client
 //	[1]    IV length
 //	[IV]   read IV
+//
+// The header and the destination form one write: the vendor server starts
+// decrypting the stream right after the IV, so a destination sent as a second
+// write would leave a window where a half-written handshake is on the wire.
 type Conn struct {
 	net.Conn
 	Cipher
@@ -137,14 +164,34 @@ type Conn struct {
 	token       []byte
 	hmac        []byte
 	paddingLen  int
-	lock        sync.Mutex
 	fakeNet     map[string]string
+
+	// readMu guards the reader side (r and its cipher stream), writeMu the
+	// writer side (w, writeIV and the handshake). Read and WriteTo share
+	// readMu; Write and ReadFrom share writeMu, so the four io paths never
+	// touch one cipher stream concurrently.
+	readMu  sync.Mutex
+	writeMu sync.Mutex
+
+	// writeErr makes a failed handshake sticky: the CTR keystream has advanced,
+	// so retrying would emit a corrupt header.
+	writeErr          error
+	handshakeDeadline time.Time
 }
 
 func (c *Conn) initReader() error {
 	if c.r != nil {
 		return nil
 	}
+	deadline := time.Now().Add(handshakeReadTimeout)
+	if !c.handshakeDeadline.IsZero() && c.handshakeDeadline.Before(deadline) {
+		deadline = c.handshakeDeadline
+	}
+	// Bounded handshake read: the echoed token is validated here, so a wrong
+	// password fails fast instead of hanging on a silent server. The deadline is
+	// cleared once the reader owns the connection again.
+	_ = c.Conn.SetReadDeadline(deadline)
+	defer func() { _ = c.Conn.SetReadDeadline(time.Time{}) }()
 	// Discard the server's forged prefix.
 	if _, err := io.CopyN(io.Discard, c.Conn, FakePrefixLen); err != nil {
 		return err
@@ -188,6 +235,9 @@ func (c *Conn) initWriter() error {
 	if c.w != nil {
 		return nil
 	}
+	if c.writeErr != nil {
+		return c.writeErr
+	}
 	iv, err := c.ObtainWriteIV()
 	if err != nil {
 		return err
@@ -209,25 +259,30 @@ func (c *Conn) initWriter() error {
 	header[offset] = byte(len(iv))
 	offset++
 	copy(header[offset:], iv)
-	if _, err := c.Conn.Write(header); err != nil {
-		return err
-	}
-	c.w = NewWriter(c.Conn, c.Encrypter(iv))
+	// Header and destination go out in one write. The destination continues the
+	// same CTR keystream the payload will use, so the encrypter is created once
+	// and handed to the writer only after the write succeeded.
+	enc := c.Encrypter(iv)
+	frame := header
 	if len(c.Destination) > 0 {
-		if _, err := c.w.Write(c.Destination); err != nil {
-			return err
-		}
+		start := len(frame)
+		frame = append(frame, c.Destination...)
+		enc.XORKeyStream(frame[start:], frame[start:])
 	}
+	if _, err := c.Conn.Write(frame); err != nil {
+		c.writeErr = fmt.Errorf("xhttp: write client handshake: %w", err)
+		return c.writeErr
+	}
+	c.w = NewWriter(c.Conn, enc)
 	return nil
 }
 
 // Read implements net.Conn.
 func (c *Conn) Read(b []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
 	if c.r == nil {
-		c.lock.Lock()
-		err := c.initReader()
-		c.lock.Unlock()
-		if err != nil {
+		if err := c.initReader(); err != nil {
 			return 0, err
 		}
 	}
@@ -237,11 +292,10 @@ func (c *Conn) Read(b []byte) (int, error) {
 // Write implements net.Conn. A zero length write only forces the handshake,
 // which is the mihomo EarlyConn convention for proxies that defer it.
 func (c *Conn) Write(b []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	if c.w == nil {
-		c.lock.Lock()
-		err := c.initWriter()
-		c.lock.Unlock()
-		if err != nil {
+		if err := c.initWriter(); err != nil {
 			return 0, err
 		}
 		if len(b) == 0 {
@@ -253,11 +307,10 @@ func (c *Conn) Write(b []byte) (int, error) {
 
 // WriteTo implements io.WriterTo.
 func (c *Conn) WriteTo(w io.Writer) (int64, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
 	if c.r == nil {
-		c.lock.Lock()
-		err := c.initReader()
-		c.lock.Unlock()
-		if err != nil {
+		if err := c.initReader(); err != nil {
 			return 0, err
 		}
 	}
@@ -266,11 +319,10 @@ func (c *Conn) WriteTo(w io.Writer) (int64, error) {
 
 // ReadFrom implements io.ReaderFrom.
 func (c *Conn) ReadFrom(r io.Reader) (int64, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	if c.w == nil {
-		c.lock.Lock()
-		err := c.initWriter()
-		c.lock.Unlock()
-		if err != nil {
+		if err := c.initWriter(); err != nil {
 			return 0, err
 		}
 	}
@@ -280,7 +332,15 @@ func (c *Conn) ReadFrom(r io.Reader) (int64, error) {
 // NeedHandshake implements sing's network.EarlyConn, so callers that know the
 // convention can force the handshake with a zero length write.
 func (c *Conn) NeedHandshake() bool {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	return c.w == nil
+}
+
+// SetHandshakeDeadline records the dial context deadline, so the handshake read
+// cannot outlive it. It must be called before the conn is used.
+func (c *Conn) SetHandshakeDeadline(deadline time.Time) {
+	c.handshakeDeadline = deadline
 }
 
 // ObtainWriteIV returns the cached write IV, generating it on first use.
@@ -328,16 +388,18 @@ func readLengthByte(r io.Reader) (byte, error) {
 }
 
 // ParsePaddingLen accepts the vendor form "<min>-<max>" (for example "8-64"),
-// a bare "<max>" or an empty string. The values are parsed for validation and
-// kept on the connection; this build does not pad the client stream.
+// a bare "<max>" or an empty string. Surrounding whitespace (a YAML quirk or a
+// hand-edited node) is ignored. The values are parsed for validation and kept on
+// the connection; this build does not pad the client stream.
 func ParsePaddingLen(value string) (minLen, maxLen int, err error) {
+	value = strings.TrimSpace(value)
 	if value == "" {
 		return 0, 0, nil
 	}
 	parse := func(s string) (int, error) {
+		s = strings.TrimSpace(s)
 		var n int
-		_, scanErr := fmt.Sscanf(s, "%d", &n)
-		if scanErr != nil {
+		if _, scanErr := fmt.Sscanf(s, "%d", &n); scanErr != nil {
 			return 0, fmt.Errorf("xhttp: invalid padding-len %q", value)
 		}
 		return n, nil

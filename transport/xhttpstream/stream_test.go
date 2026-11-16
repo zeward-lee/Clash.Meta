@@ -7,8 +7,10 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -229,5 +231,235 @@ func TestTokenMatchesVendorFormula(t *testing.T) {
 	}
 	if bytes.Equal(Token("secret"), Token("secret2")) {
 		t.Fatal("different secrets produced the same token")
+	}
+}
+
+// recordConn captures every Write so a test can prove the handshake is one
+// write, and fails on demand to exercise the error path.
+type recordConn struct {
+	mu     sync.Mutex
+	writes [][]byte
+	err    error
+}
+
+func (c *recordConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (c *recordConn) Write(b []byte) (int, error)      { return c.record(b) }
+func (c *recordConn) Close() error                     { return nil }
+func (c *recordConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *recordConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *recordConn) SetDeadline(time.Time) error      { return nil }
+func (c *recordConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *recordConn) SetWriteDeadline(time.Time) error { return nil }
+
+func (c *recordConn) record(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil {
+		return 0, c.err
+	}
+	copied := make([]byte, len(b))
+	copy(copied, b)
+	c.writes = append(c.writes, copied)
+	return len(b), nil
+}
+
+// TestInitWriterSendsHeaderAndDestinationInOneWrite covers the P1 "半写死锁":
+// the 128 byte prefix, token, HMAC, IV and the encrypted destination must leave
+// as a single write, and the destination must continue the same CTR keystream
+// the payload uses.
+func TestInitWriterSendsHeaderAndDestinationInOneWrite(t *testing.T) {
+	ciph := testCipher(t)
+	conn := &recordConn{}
+	destination := []byte{0x03, 0x0b}
+	destination = append(destination, []byte("example.com")...)
+	destination = append(destination, 0x01, 0xbb)
+	stream := ciph.StreamConn(conn, destination).(*Conn)
+	if _, err := stream.Write(nil); err != nil {
+		t.Fatalf("force handshake: %v", err)
+	}
+	if len(conn.writes) != 1 {
+		t.Fatalf("handshake used %d writes, want 1", len(conn.writes))
+	}
+	frame := conn.writes[0]
+	headerLen := FakePrefixLen + len(ciph.token) + len(ciph.hmac) + 1 + 16
+	if len(frame) != headerLen+len(destination) {
+		t.Fatalf("frame length = %d, want %d", len(frame), headerLen+len(destination))
+	}
+	iv := frame[headerLen-16 : headerLen]
+	if int(frame[headerLen-17]) != 16 {
+		t.Fatalf("iv length byte = %d, want 16", frame[headerLen-17])
+	}
+	plain := make([]byte, len(destination))
+	cipher.NewCTR(mustBlock(t), iv).XORKeyStream(plain, frame[headerLen:])
+	if !bytes.Equal(plain, destination) {
+		t.Fatalf("destination = %x, want %x", plain, destination)
+	}
+	// The payload continues the same keystream, so a payload written next must
+	// decrypt to itself: force a known payload through the writer.
+	if _, err := stream.Write([]byte("hello")); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	if len(conn.writes) != 2 {
+		t.Fatalf("payload write count = %d, want 2 total", len(conn.writes))
+	}
+	payloadPlain := make([]byte, 5)
+	// Continue the CTR stream: the destination consumed len(destination) bytes.
+	stream2 := cipher.NewCTR(mustBlock(t), iv)
+	stream2.XORKeyStream(make([]byte, len(destination)), make([]byte, len(destination)))
+	stream2.XORKeyStream(payloadPlain, conn.writes[1])
+	if string(payloadPlain) != "hello" {
+		t.Fatalf("payload = %q, want hello", payloadPlain)
+	}
+}
+
+func mustBlock(t *testing.T) cipher.Block {
+	t.Helper()
+	block, err := aes.NewCipher(Kdf(testSecret, 16))
+	if err != nil {
+		t.Fatalf("aes: %v", err)
+	}
+	return block
+}
+
+// TestInitWriterFailureIsSticky covers the second half of the same fix: a failed
+// handshake write returns a clear error and is never retried, so a partial
+// header can not be followed by a second (misaligned) one.
+func TestInitWriterFailureIsSticky(t *testing.T) {
+	ciph := testCipher(t)
+	boom := errors.New("write refused")
+	conn := &recordConn{err: boom}
+	stream := ciph.StreamConn(conn, []byte{0x01, 0x01, 0x02, 0x03, 0x00, 0x35})
+	if _, err := stream.Write(nil); !errors.Is(err, boom) {
+		t.Fatalf("first write error = %v, want %v", err, boom)
+	}
+	conn.mu.Lock()
+	conn.err = nil // a retry would now succeed if it were attempted
+	conn.mu.Unlock()
+	if _, err := stream.Write([]byte("hello")); err == nil {
+		t.Fatal("a failed handshake was retried silently")
+	}
+	if len(conn.writes) != 0 {
+		t.Fatalf("conn saw %d writes after a failed handshake, want 0", len(conn.writes))
+	}
+}
+
+// TestHandshakeReadIsBounded covers the token check running under a deadline: a
+// server that accepts the connection and stays silent must not hang the first
+// read forever.
+func TestHandshakeReadIsBounded(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("listen: %v", err)
+	}
+	defer listener.Close()
+	accepted := make(chan struct{})
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		close(accepted)
+		// Read the client handshake but never answer it.
+		_, _ = io.Copy(io.Discard, conn)
+		_ = conn.Close()
+	}()
+
+	ciph := testCipher(t)
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	stream := ciph.StreamConn(conn, nil).(*Conn)
+	stream.SetHandshakeDeadline(time.Now().Add(150 * time.Millisecond))
+	if _, err := stream.Write(nil); err != nil {
+		t.Fatalf("force handshake: %v", err)
+	}
+	<-accepted
+	start := time.Now()
+	_, err = stream.Read(make([]byte, 1))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Read against a silent server returned no error")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("handshake read took %v, the deadline was not applied", elapsed)
+	}
+}
+
+// TestPacketConnRemoteAddrIsTheServer covers the plain UDP target semantics: the
+// carrier is the configured server, never a metadata address.
+func TestPacketConnRemoteAddrIsTheServer(t *testing.T) {
+	ciph := testCipher(t)
+	server := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 50775}
+	pc := ciph.PacketConn(&recordConn{}, server).(*PacketConn)
+	if pc.RemoteAddr() == nil || pc.RemoteAddr().String() != server.String() {
+		t.Fatalf("RemoteAddr = %v, want %v", pc.RemoteAddr(), server)
+	}
+}
+
+// TestPacketConnWriteToEncodesTarget walks one plain UDP frame back to its
+// address and payload, including a SOCKS domain target (the case the udp relay
+// hands over when the destination was never resolved).
+func TestPacketConnWriteToEncodesTarget(t *testing.T) {
+	ciph := testCipher(t)
+	conn := &recordConn{}
+	server := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 50775}
+	pc := ciph.PacketConn(conn, server)
+	target := &domainAddr{host: "dns.example", port: 53}
+	n, err := pc.WriteTo([]byte("query"), target)
+	if err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	if n != 5 {
+		t.Fatalf("WriteTo n = %d, want 5", n)
+	}
+	if len(conn.writes) != 1 {
+		t.Fatalf("WriteTo used %d writes, want 1", len(conn.writes))
+	}
+	frame := conn.writes[0]
+	offset := FakePrefixLen + len(ciph.token) + len(ciph.hmac)
+	if offset+1 > len(frame) {
+		t.Fatalf("short frame %d", len(frame))
+	}
+	ivLen := int(frame[offset])
+	offset++
+	if ivLen != 16 || offset+ivLen > len(frame) {
+		t.Fatalf("iv length = %d", ivLen)
+	}
+	iv := frame[offset : offset+ivLen]
+	offset += ivLen
+	plain := make([]byte, len(frame)-offset)
+	ciph.Decrypter(iv).XORKeyStream(plain, frame[offset:])
+	addr, payload, err := decodeSocksAddr(plain)
+	if err != nil {
+		t.Fatalf("decodeSocksAddr: %v", err)
+	}
+	if addr.String() != target.String() {
+		t.Fatalf("address = %s, want %s", addr, target)
+	}
+	if string(payload) != "query" {
+		t.Fatalf("payload = %q", payload)
+	}
+}
+
+func TestParsePaddingLenTrimsWhitespace(t *testing.T) {
+	cases := map[string][2]int{
+		" 8-64 ": {8, 64},
+		" 16 ":   {0, 16},
+		"8 - 64": {8, 64},
+		"":       {0, 0},
+	}
+	for value, want := range cases {
+		minLen, maxLen, err := ParsePaddingLen(value)
+		if err != nil {
+			t.Fatalf("ParsePaddingLen(%q): %v", value, err)
+		}
+		if minLen != want[0] || maxLen != want[1] {
+			t.Fatalf("ParsePaddingLen(%q) = %d-%d, want %d-%d", value, minLen, maxLen, want[0], want[1])
+		}
+	}
+	if _, _, err := ParsePaddingLen(" 64-8 "); err == nil {
+		t.Fatal("inverted range accepted")
 	}
 }
