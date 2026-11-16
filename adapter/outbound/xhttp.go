@@ -158,6 +158,15 @@ func applyConfigBlob(option *XhttpOption) error {
 		return nil
 	}
 	var fromBlob XhttpOption
+	// A blob is an overlay, not a whole node: it may leave out `name`,
+	// `server` or `port`, which the decoder treats as required tags. Seed those
+	// keys from the YAML value when the blob omits them so the overlay decodes;
+	// explicitKeys/fillMissing still keep the YAML values.
+	for key, value := range map[string]any{"name": option.Name, "server": option.Server, "port": option.Port} {
+		if _, ok := blob[key]; !ok {
+			blob[key] = value
+		}
+	}
 	decoder := structure.NewDecoder(structure.Option{TagName: "proxy", WeaklyTypedInput: true, KeyReplacer: structure.DefaultKeyReplacer})
 	if err := decoder.Decode(blob, &fromBlob); err != nil {
 		return fmt.Errorf("xhttp: decode node config fields: %w", err)

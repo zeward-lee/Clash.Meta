@@ -50,21 +50,21 @@ type NinjaWSOptions struct {
 
 type NinjaOption struct {
 	BasicOption
-	Name             string            `proxy:"name"`
-	Server           string            `proxy:"server"`
-	Port             int               `proxy:"port"`
-	Password         string            `proxy:"password,omitempty"`
-	NodePassword     string            `proxy:"node-password"`
-	Method           string            `proxy:"method"`
-	UDP              bool              `proxy:"udp,omitempty"`
-	TLS              bool              `proxy:"tls,omitempty"`
-	Servername       string            `proxy:"servername,omitempty"`
-	SNI              string            `proxy:"sni,omitempty"`
-	SkipCertVerify   bool              `proxy:"skip-cert-verify,omitempty"`
-	Network          string            `proxy:"network,omitempty"`
-	WSOpts           NinjaWSOptions    `proxy:"ws-opts,omitempty"`
-	Pass             bool              `proxy:"pass,omitempty"`
-	PassOpts         NinjaPassOptions  `proxy:"pass-opts,omitempty"`
+	Name           string           `proxy:"name"`
+	Server         string           `proxy:"server"`
+	Port           int              `proxy:"port"`
+	Password       string           `proxy:"password,omitempty"`
+	NodePassword   string           `proxy:"node-password"`
+	Method         string           `proxy:"method"`
+	UDP            bool             `proxy:"udp,omitempty"`
+	TLS            bool             `proxy:"tls,omitempty"`
+	Servername     string           `proxy:"servername,omitempty"`
+	SNI            string           `proxy:"sni,omitempty"`
+	SkipCertVerify bool             `proxy:"skip-cert-verify,omitempty"`
+	Network        string           `proxy:"network,omitempty"`
+	WSOpts         NinjaWSOptions   `proxy:"ws-opts,omitempty"`
+	Pass           bool             `proxy:"pass,omitempty"`
+	PassOpts       NinjaPassOptions `proxy:"pass-opts,omitempty"`
 }
 
 // DialContext implements C.ProxyAdapter

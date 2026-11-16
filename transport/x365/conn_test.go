@@ -63,7 +63,7 @@ func TestRequestHeaderWithUUIDSuffix(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 
-	conn := NewClient(testUUID + "#x365").StreamConn(client, dst)
+	conn := NewClient(testUUID+"#x365").StreamConn(client, dst)
 	go func() {
 		_, _ = conn.Write([]byte("hello"))
 	}()
