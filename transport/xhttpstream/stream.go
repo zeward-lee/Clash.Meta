@@ -216,14 +216,17 @@ func (c *Conn) initReader() error {
 			return err
 		}
 	}
-	ivLen, err := readLengthByte(c.Conn)
+	ivLenByte, err := readLengthByte(c.Conn)
 	if err != nil {
 		return err
 	}
+	// readLengthByte returns a byte while IVSize returns an int: widen once so
+	// the comparison, the error text and ObtainReadIV share a single type.
+	ivLen := int(ivLenByte)
 	if ivLen != c.IVSize() {
 		return fmt.Errorf("xhttp: unexpected read IV length %d (want %d)", ivLen, c.IVSize())
 	}
-	iv, err := c.ObtainReadIV(int(ivLen))
+	iv, err := c.ObtainReadIV(ivLen)
 	if err != nil {
 		return err
 	}
