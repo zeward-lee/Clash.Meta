@@ -66,7 +66,6 @@ func HttpRequest(ctx context.Context, url, method string, header map[string][]st
 	if err != nil {
 		return nil, err
 	}
-	applyTLSConfigHook(opt.caOption, tlsConfig)
 
 	transport := &http.Transport{
 		// from http.DefaultTransport

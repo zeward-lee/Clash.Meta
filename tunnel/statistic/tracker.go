@@ -3,6 +3,7 @@ package statistic
 import (
 	"io"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -31,6 +32,7 @@ type TrackerInfo struct {
 	ProviderChain C.Chain      `json:"providerChains"`
 	Rule          string       `json:"rule"`
 	RulePayload   string       `json:"rulePayload"`
+	IsDirect      bool         `json:"-"`
 }
 
 type tcpTracker struct {
@@ -38,8 +40,8 @@ type tcpTracker struct {
 	*TrackerInfo
 	manager *Manager
 
-	pushToManager bool `json:"-"`
-	direct        bool `json:"-"`
+	pushToManager bool        `json:"-"`
+	closed        atomic.Bool `json:"-"`
 }
 
 func (tt *tcpTracker) ID() string {
@@ -54,7 +56,7 @@ func (tt *tcpTracker) Read(b []byte) (int, error) {
 	n, err := tt.Conn.Read(b)
 	download := int64(n)
 	if tt.pushToManager {
-		tt.manager.PushDownloaded(tt.direct, download)
+		tt.manager.PushDownloaded(tt.IsDirect, download)
 	}
 	tt.DownloadTotal.Add(download)
 	return n, err
@@ -64,7 +66,7 @@ func (tt *tcpTracker) ReadBuffer(buffer *buf.Buffer) (err error) {
 	err = tt.Conn.ReadBuffer(buffer)
 	download := int64(buffer.Len())
 	if tt.pushToManager {
-		tt.manager.PushDownloaded(tt.direct, download)
+		tt.manager.PushDownloaded(tt.IsDirect, download)
 	}
 	tt.DownloadTotal.Add(download)
 	return
@@ -73,7 +75,7 @@ func (tt *tcpTracker) ReadBuffer(buffer *buf.Buffer) (err error) {
 func (tt *tcpTracker) UnwrapReader() (io.Reader, []N.CountFunc) {
 	return tt.Conn, []N.CountFunc{func(download int64) {
 		if tt.pushToManager {
-			tt.manager.PushDownloaded(tt.direct, download)
+			tt.manager.PushDownloaded(tt.IsDirect, download)
 		}
 		tt.DownloadTotal.Add(download)
 	}}
@@ -83,7 +85,7 @@ func (tt *tcpTracker) Write(b []byte) (int, error) {
 	n, err := tt.Conn.Write(b)
 	upload := int64(n)
 	if tt.pushToManager {
-		tt.manager.PushUploaded(tt.direct, upload)
+		tt.manager.PushUploaded(tt.IsDirect, upload)
 	}
 	tt.UploadTotal.Add(upload)
 	return n, err
@@ -93,7 +95,7 @@ func (tt *tcpTracker) WriteBuffer(buffer *buf.Buffer) (err error) {
 	upload := int64(buffer.Len())
 	err = tt.Conn.WriteBuffer(buffer)
 	if tt.pushToManager {
-		tt.manager.PushUploaded(tt.direct, upload)
+		tt.manager.PushUploaded(tt.IsDirect, upload)
 	}
 	tt.UploadTotal.Add(upload)
 	return
@@ -102,14 +104,16 @@ func (tt *tcpTracker) WriteBuffer(buffer *buf.Buffer) (err error) {
 func (tt *tcpTracker) UnwrapWriter() (io.Writer, []N.CountFunc) {
 	return tt.Conn, []N.CountFunc{func(upload int64) {
 		if tt.pushToManager {
-			tt.manager.PushUploaded(tt.direct, upload)
+			tt.manager.PushUploaded(tt.IsDirect, upload)
 		}
 		tt.UploadTotal.Add(upload)
 	}}
 }
 
 func (tt *tcpTracker) Close() error {
-	tt.manager.Leave(tt)
+	if tt.closed.CompareAndSwap(false, true) {
+		tt.manager.Leave(tt)
+	}
 	return tt.Conn.Close()
 }
 
@@ -120,6 +124,10 @@ func (tt *tcpTracker) Upstream() any {
 func NewTCPTracker(conn C.Conn, manager *Manager, metadata *C.Metadata, rule C.Rule, uploadTotal int64, downloadTotal int64, pushToManager bool) *tcpTracker {
 	metadata.RemoteDst = conn.RemoteDestination()
 
+	chains := conn.Chains()
+	lastChain := chains.Last()
+	isDirect := strings.ToUpper(lastChain) == "DIRECT" || (IsDirectFunc != nil && IsDirectFunc(lastChain))
+
 	tt := &tcpTracker{
 		Conn:    conn,
 		manager: manager,
@@ -127,22 +135,22 @@ func NewTCPTracker(conn C.Conn, manager *Manager, metadata *C.Metadata, rule C.R
 			UUID:          utils.NewUUIDV4(),
 			Start:         time.Now(),
 			Metadata:      metadata,
-			Chain:         conn.Chains(),
+			Chain:         chains,
 			ProviderChain: conn.ProviderChains(),
 			Rule:          "",
 			UploadTotal:   atomic.NewInt64(uploadTotal),
 			DownloadTotal: atomic.NewInt64(downloadTotal),
+			IsDirect:      isDirect,
 		},
 		pushToManager: pushToManager,
-		direct:        IsDirect(conn.Chains().Last()),
 	}
 
 	if pushToManager {
 		if uploadTotal > 0 {
-			manager.PushUploaded(tt.direct, uploadTotal)
+			manager.PushUploaded(isDirect, uploadTotal)
 		}
 		if downloadTotal > 0 {
-			manager.PushDownloaded(tt.direct, downloadTotal)
+			manager.PushDownloaded(isDirect, downloadTotal)
 		}
 	}
 
@@ -160,8 +168,8 @@ type udpTracker struct {
 	*TrackerInfo
 	manager *Manager
 
-	pushToManager bool `json:"-"`
-	direct        bool `json:"-"`
+	pushToManager bool        `json:"-"`
+	closed        atomic.Bool `json:"-"`
 }
 
 func (ut *udpTracker) ID() string {
@@ -176,7 +184,7 @@ func (ut *udpTracker) ReadFrom(b []byte) (int, net.Addr, error) {
 	n, addr, err := ut.PacketConn.ReadFrom(b)
 	download := int64(n)
 	if ut.pushToManager {
-		ut.manager.PushDownloaded(ut.direct, download)
+		ut.manager.PushDownloaded(ut.IsDirect, download)
 	}
 	ut.DownloadTotal.Add(download)
 	return n, addr, err
@@ -186,7 +194,7 @@ func (ut *udpTracker) WaitReadFrom() (data []byte, put func(), addr net.Addr, er
 	data, put, addr, err = ut.PacketConn.WaitReadFrom()
 	download := int64(len(data))
 	if ut.pushToManager {
-		ut.manager.PushDownloaded(ut.direct, download)
+		ut.manager.PushDownloaded(ut.IsDirect, download)
 	}
 	ut.DownloadTotal.Add(download)
 	return
@@ -196,14 +204,16 @@ func (ut *udpTracker) WriteTo(b []byte, addr net.Addr) (int, error) {
 	n, err := ut.PacketConn.WriteTo(b, addr)
 	upload := int64(n)
 	if ut.pushToManager {
-		ut.manager.PushUploaded(ut.direct, upload)
+		ut.manager.PushUploaded(ut.IsDirect, upload)
 	}
 	ut.UploadTotal.Add(upload)
 	return n, err
 }
 
 func (ut *udpTracker) Close() error {
-	ut.manager.Leave(ut)
+	if ut.closed.CompareAndSwap(false, true) {
+		ut.manager.Leave(ut)
+	}
 	return ut.PacketConn.Close()
 }
 
@@ -214,6 +224,10 @@ func (ut *udpTracker) Upstream() any {
 func NewUDPTracker(conn C.PacketConn, manager *Manager, metadata *C.Metadata, rule C.Rule, uploadTotal int64, downloadTotal int64, pushToManager bool) *udpTracker {
 	metadata.RemoteDst = conn.RemoteDestination()
 
+	chains := conn.Chains()
+	lastChain := chains.Last()
+	isDirect := strings.ToUpper(lastChain) == "DIRECT" || (IsDirectFunc != nil && IsDirectFunc(lastChain))
+
 	ut := &udpTracker{
 		PacketConn: conn,
 		manager:    manager,
@@ -221,22 +235,22 @@ func NewUDPTracker(conn C.PacketConn, manager *Manager, metadata *C.Metadata, ru
 			UUID:          utils.NewUUIDV4(),
 			Start:         time.Now(),
 			Metadata:      metadata,
-			Chain:         conn.Chains(),
+			Chain:         chains,
 			ProviderChain: conn.ProviderChains(),
 			Rule:          "",
 			UploadTotal:   atomic.NewInt64(uploadTotal),
 			DownloadTotal: atomic.NewInt64(downloadTotal),
+			IsDirect:      isDirect,
 		},
 		pushToManager: pushToManager,
-		direct:        IsDirect(conn.Chains().Last()),
 	}
 
 	if pushToManager {
 		if uploadTotal > 0 {
-			manager.PushUploaded(ut.direct, uploadTotal)
+			manager.PushUploaded(isDirect, uploadTotal)
 		}
 		if downloadTotal > 0 {
-			manager.PushDownloaded(ut.direct, downloadTotal)
+			manager.PushDownloaded(isDirect, downloadTotal)
 		}
 	}
 

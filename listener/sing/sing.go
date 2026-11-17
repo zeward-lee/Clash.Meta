@@ -213,13 +213,18 @@ type localAddr interface {
 }
 
 func (h *ListenerHandler) NewPacket(ctx context.Context, key netip.AddrPort, buffer *buf.Buffer, metadata M.Metadata, init func(natConn network.PacketConn) network.PacketWriter) {
+	h.NewPacketWithRejecter(ctx, key, buffer, metadata, init, nil)
+}
+
+func (h *ListenerHandler) NewPacketWithRejecter(ctx context.Context, key netip.AddrPort, buffer *buf.Buffer, metadata M.Metadata, init func(natConn network.PacketConn) network.PacketWriter, rejecter func() error) {
 	writer := bufio.NewNetPacketWriter(init(nil))
 	mutex := sync.Mutex{}
 	cPacket := &packet{
-		writer: &writer,
-		mutex:  &mutex,
-		rAddr:  metadata.Source.UDPAddr(),
-		buff:   buffer,
+		writer:   &writer,
+		mutex:    &mutex,
+		rAddr:    metadata.Source.UDPAddr(),
+		buff:     buffer,
+		rejecter: rejecter,
 	}
 	if h.Type != C.TUN { // make the handler-related SNAT key for not TUN listener
 		connID := fmt.Sprintf("%s:%s", h.handlerId, key)
@@ -268,11 +273,19 @@ func ShouldIgnorePacketError(err error) bool {
 }
 
 type packet struct {
-	writer *network.NetPacketWriter
-	mutex  *sync.Mutex
-	rAddr  net.Addr
-	lAddr  net.Addr
-	buff   *buf.Buffer
+	writer   *network.NetPacketWriter
+	mutex    *sync.Mutex
+	rAddr    net.Addr
+	lAddr    net.Addr
+	buff     *buf.Buffer
+	rejecter func() error
+}
+
+func (c *packet) Reject() error {
+	if c.rejecter != nil {
+		return c.rejecter()
+	}
+	return nil
 }
 
 func (c *packet) Data() []byte {

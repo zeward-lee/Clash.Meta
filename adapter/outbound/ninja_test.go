@@ -61,7 +61,7 @@ func TestNinjaOutboundEcho(t *testing.T) {
 		Name:         "n1",
 		Server:       host,
 		Port:         port,
-		Password:     "testpass", // AEAD key, must match the echo server above
+		Password:     "testpass",
 		NodePassword: "testpass",
 		Method:       "aes-128-gcm",
 	})

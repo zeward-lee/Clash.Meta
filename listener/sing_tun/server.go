@@ -39,6 +39,28 @@ import (
 var InterfaceName = "Meta"
 var EnforceBindInterface = false
 
+var (
+	tunLogMu       sync.Mutex
+	tunLogLastTime time.Time
+	tunLogCount    int
+)
+
+func shouldLogTun() bool {
+	tunLogMu.Lock()
+	defer tunLogMu.Unlock()
+
+	now := time.Now()
+	if now.Sub(tunLogLastTime) >= time.Second {
+		tunLogLastTime = now
+		tunLogCount = 0
+	}
+	if tunLogCount >= 10 {
+		return false
+	}
+	tunLogCount++
+	return true
+}
+
 type Listener struct {
 	closed  bool
 	options LC.Tun
@@ -73,6 +95,7 @@ type ListenerHandler struct {
 	Inet4Address          []netip.Prefix
 	Inet6Address          []netip.Prefix
 	DisableICMPForwarding bool
+	tunIf                 tun.Tun
 }
 
 var emptyAddressSet = []*netipx.IPSet{{}}
@@ -477,6 +500,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		}
 
 	}
+
 	tunIf, err := tunNew(tunOptions)
 	if err != nil {
 		err = E.Cause(err, "configure tun interface")
@@ -502,6 +526,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		EnforceBindInterface:   EnforceBindInterface,
 	}
 	l.tunIf = tunIf
+	handler.tunIf = tunIf
 
 	tunStack, err := tun.NewStack(strings.ToLower(options.Stack.String()), stackOptions)
 	if err != nil {
@@ -624,15 +649,21 @@ func (d *cDialerInterfaceFinder) FindInterfaceName(destination netip.Addr) strin
 	for _, dest := range []netip.Addr{destination, netip.IPv4Unspecified(), netip.IPv6Unspecified()} {
 		autoDetectInterfaceName := d.DefaultInterfaceName(dest)
 		if autoDetectInterfaceName == d.tunName {
-			log.Warnln("[TUN] Auto detect interface for %s get same name with tun", destination.String())
+			if shouldLogTun() {
+				log.Warnln("[TUN] Auto detect interface for %s get same name with tun", destination.String())
+			}
 		} else if autoDetectInterfaceName == "" || autoDetectInterfaceName == "<nil>" {
-			log.Warnln("[TUN] Auto detect interface for %s get empty name.", destination.String())
+			if shouldLogTun() {
+				log.Warnln("[TUN] Auto detect interface for %s get empty name.", destination.String())
+			}
 		} else {
 			log.Debugln("[TUN] Auto detect interface for %s --> %s", destination, autoDetectInterfaceName)
 			return autoDetectInterfaceName
 		}
 	}
-	log.Warnln("[TUN] Auto detect interface for %s failed, return '<invalid>' to avoid lookback", destination)
+	if shouldLogTun() {
+		log.Warnln("[TUN] Auto detect interface for %s failed, return '<invalid>' to avoid lookback", destination)
+	}
 	return "<invalid>"
 }
 

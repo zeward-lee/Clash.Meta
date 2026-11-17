@@ -60,6 +60,26 @@ const (
 	Ninja
 	Oppa
 	XHttp
+	// Shanlian and Fastup share another protocol's wire (anytls and trojan
+	// respectively) but are published as their own `type` by the vendor
+	// subscriptions, so they carry a distinct identity for the API/UI. Always
+	// append new types: the numeric values of the previous entries must not
+	// shift.
+	Shanlian
+	Fastup
+	// The remaining vendor variants borrow a base protocol's wire the same way:
+	// the marker that switches the wire travels in the node's password or uuid,
+	// and the adapter publishes the vendor identity instead of the base protocol
+	// so the API and the UI show the protocol's own name.
+	ViewTurbo
+	Blackstone
+	OIX
+	Juzi
+	Pure
+	// SNTPEclipse is the vendor's own transport (type `sntp-eclipse`, wire
+	// `sntp-eclipse-v3-native-1`): X25519 + XChaCha20-Poly1305 records over
+	// TCP. Appended at the end for the same reason as the types above.
+	SNTPEclipse
 )
 
 const (
@@ -258,6 +278,22 @@ func (at AdapterType) String() string {
 		return "Oppa"
 	case XHttp:
 		return "XHttp"
+	case Shanlian:
+		return "Shanlian"
+	case Fastup:
+		return "Fastup"
+	case ViewTurbo:
+		return "ViewTurbo"
+	case Blackstone:
+		return "Blackstone"
+	case OIX:
+		return "OIX"
+	case Juzi:
+		return "Juzi"
+	case Pure:
+		return "Pure"
+	case SNTPEclipse:
+		return "SNTP"
 	case Relay:
 		return "Relay"
 	case Selector:
@@ -318,6 +354,17 @@ func (s *packetAdapter) Metadata() *Metadata {
 // Key is a SNAT key
 func (s *packetAdapter) Key() string {
 	return s.key
+}
+
+type PacketRejector interface {
+	Reject() error
+}
+
+func (s *packetAdapter) Reject() error {
+	if rejector, ok := s.UDPPacket.(PacketRejector); ok {
+		return rejector.Reject()
+	}
+	return nil
 }
 
 func NewPacketAdapter(packet UDPPacket, metadata *Metadata) PacketAdapter {

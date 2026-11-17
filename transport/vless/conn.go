@@ -1,6 +1,8 @@
 package vless
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -21,6 +23,8 @@ type Conn struct {
 	addons   *Addons
 	received bool
 	sent     bool
+	isJuzi   bool
+	isX365   bool
 }
 
 func (vc *Conn) Read(b []byte) (int, error) {
@@ -68,6 +72,38 @@ func (vc *Conn) WriteBuffer(buffer *buf.Buffer) error {
 }
 
 func (vc *Conn) sendRequest(p []byte) (err error) {
+	if vc.isX365 {
+		// x365 request: [\"X365\"][0x01][command][uuid 16][port 2][atyp][addr][payload]
+		requestLen := len("X365") + 1 + 1 + 16
+		if !vc.dst.Mux {
+			requestLen += 2 + 1 + len(vc.dst.Addr)
+		}
+		requestLen += len(p)
+
+		buffer := buf.NewSize(requestLen)
+		defer buffer.Release()
+
+		buf.Must(buf.Error(buffer.Write([]byte{'X', '3', '6', '5', 0x01})))
+		if vc.dst.Mux {
+			buf.Must(buffer.WriteByte(CommandMux))
+		} else if vc.dst.UDP {
+			buf.Must(buffer.WriteByte(CommandUDP))
+		} else {
+			buf.Must(buffer.WriteByte(CommandTCP))
+		}
+		buf.Must(buf.Error(buffer.Write(vc.id.Bytes())))
+		if !vc.dst.Mux {
+			binary.BigEndian.PutUint16(buffer.Extend(2), vc.dst.Port)
+			buf.Must(
+				buffer.WriteByte(vc.dst.AddrType),
+				buf.Error(buffer.Write(vc.dst.Addr)),
+			)
+		}
+		buf.Must(buf.Error(buffer.Write(p)))
+		_, err = vc.ExtendedConn.Write(buffer.Bytes())
+		return
+	}
+
 	var addonsBytes []byte
 	if vc.addons != nil {
 		addonsBytes, err = proto.Marshal(vc.addons)
@@ -78,7 +114,10 @@ func (vc *Conn) sendRequest(p []byte) (err error) {
 
 	requestLen := 1  // protocol version
 	requestLen += 16 // UUID
-	requestLen += 1  // addons length
+	if vc.isJuzi {
+		requestLen += 8 // Juzi authentication tag
+	}
+	requestLen += 1 // addons length
 	requestLen += len(addonsBytes)
 	requestLen += 1 // command
 	if !vc.dst.Mux {
@@ -94,6 +133,16 @@ func (vc *Conn) sendRequest(p []byte) (err error) {
 	buf.Must(
 		buffer.WriteByte(Version),              // protocol version
 		buf.Error(buffer.Write(vc.id.Bytes())), // 16 bytes of uuid
+	)
+	if vc.isJuzi {
+		// Juzi authenticates the fixed request prefix: the first 8 bytes of
+		// HMAC-SHA256("hello_pidun", version || uuid).
+		mac := hmac.New(sha256.New, []byte("hello_pidun"))
+		_, _ = mac.Write([]byte{Version})
+		_, _ = mac.Write(vc.id[:])
+		buf.Must(buf.Error(buffer.Write(mac.Sum(nil)[:8])))
+	}
+	buf.Must(
 		buffer.WriteByte(byte(len(addonsBytes))),
 		buf.Error(buffer.Write(addonsBytes)),
 	)
@@ -121,6 +170,20 @@ func (vc *Conn) sendRequest(p []byte) (err error) {
 }
 
 func (vc *Conn) recvResponse() (err error) {
+	if vc.isX365 {
+		// The x365 response starts with the same magic as the request; the fifth
+		// byte is not interpreted here (the standalone type: x365 outbound owns the
+		// stricter check and its wire notes).
+		var header [5]byte
+		if _, err = io.ReadFull(vc.ExtendedConn, header[:]); err != nil {
+			return err
+		}
+		if header[0] != 'X' || header[1] != '3' || header[2] != '6' || header[3] != '5' {
+			return errors.New("invalid x365 response header")
+		}
+		return nil
+	}
+
 	var buffer [2]byte
 	_, err = io.ReadFull(vc.ExtendedConn, buffer[:])
 	if err != nil {
@@ -162,6 +225,8 @@ func newConn(conn net.Conn, client *Client, dst *DstAddr) (net.Conn, error) {
 		id:           client.uuid,
 		addons:       client.Addons,
 		dst:          dst,
+		isJuzi:       client.mode == ModeJuzi,
+		isX365:       client.IsX365,
 	}
 
 	if client.Addons != nil {

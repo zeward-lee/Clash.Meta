@@ -12,9 +12,11 @@ import (
 	"github.com/metacubex/mihomo/component/proxydialer"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/anytls"
+	"github.com/metacubex/mihomo/transport/v2rayxhttp"
 	"github.com/metacubex/mihomo/transport/vmess"
 
 	M "github.com/metacubex/sing/common/metadata"
+	singN "github.com/metacubex/sing/common/network"
 	"github.com/metacubex/sing/common/uot"
 )
 
@@ -22,6 +24,9 @@ type AnyTLS struct {
 	*Base
 	client *anytls.Client
 	option *AnyTLSOption
+	// xhttp is set when the node carries a `transport: xhttp` block; the anytls
+	// client then dials XHTTP streams instead of plain TCP sockets.
+	xhttp *v2rayxhttp.Client
 }
 
 type AnyTLSOption struct {
@@ -48,6 +53,11 @@ type AnyTLSOption struct {
 	IdleSessionTimeout       int              `proxy:"idle-session-timeout,omitempty"`
 	MinIdleSession           int              `proxy:"min-idle-session,omitempty"`
 	DisableReuse             bool             `proxy:"disable-reuse,omitempty"`
+	// Transport selects a transport layer between the TCP socket and the anytls
+	// session. Only "xhttp" (the vendor `transport/v2rayxhttp`) is implemented;
+	// leaving it empty keeps the node a plain anytls-over-TLS outbound.
+	Transport string                `proxy:"transport,omitempty"`
+	XHTTPOpts XHTTPTransportOptions `proxy:"xhttp-opts,omitempty"`
 }
 
 func (t *AnyTLS) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
@@ -88,7 +98,29 @@ func (t *AnyTLS) ProxyInfo() C.ProxyInfo {
 
 // Close implements C.ProxyAdapter
 func (t *AnyTLS) Close() error {
-	return t.client.Close()
+	err := t.client.Close()
+	if t.xhttp != nil {
+		_ = t.xhttp.Close()
+	}
+	return err
+}
+
+// IsShanlianPassword reports whether the password carries the Shanlian marker.
+// The parser uses it to give the old `type: anytls` spelling of a Shanlian node
+// the vendor identity, mirroring IsFastupTrojanPassword for the trojan wire.
+func IsShanlianPassword(password string) bool {
+	return anytls.IsShanlianPassword(password)
+}
+
+// EnsureShanlianPasswordMarker appends the "#sl" marker to a password that does
+// not carry it. Subscriptions that publish `type: shanlian` may omit the marker
+// because the type already implies the variant; the anytls client still keys
+// the direct authentication off the marker, so translate it once in the parser.
+func EnsureShanlianPasswordMarker(password string) string {
+	if anytls.IsShanlianPassword(password) {
+		return password
+	}
+	return password + anytls.ShanlianPasswordMarker
 }
 
 func NewAnyTLS(option AnyTLSOption) (*AnyTLS, error) {
@@ -110,16 +142,38 @@ func NewAnyTLS(option AnyTLSOption) (*AnyTLS, error) {
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
 	singDialer := proxydialer.NewSingDialer(outbound.dialer)
+	var sessionDialer singN.Dialer = singDialer
+	skipAnyTLSTLS := false
+	if option.Transport != "" {
+		// The vendor dedicated lines run anytls inside a `transport/v2rayxhttp`
+		// (XHTTP) stream pair instead of a plain TCP socket. Swap the dialer the
+		// anytls session uses. The XHTTP transport already runs inside its own TLS
+		// (one handshake per endpoint), so the anytls layer must NOT add a second
+		// one: the vendor server expects the credential as the first bytes of the
+		// upload body and reads a TLS ClientHello as a bad credential otherwise.
+		transport := strings.ToLower(strings.TrimSpace(option.Transport))
+		if transport != "xhttp" && transport != "v2rayxhttp" {
+			return nil, errors.New("anytls: unsupported transport: " + option.Transport)
+		}
+		xhttpClient, err := newXHTTPTransport(&option, singDialer)
+		if err != nil {
+			return nil, err
+		}
+		outbound.xhttp = xhttpClient
+		sessionDialer = v2rayxhttp.NewDialer(xhttpClient)
+		skipAnyTLSTLS = true
+	}
 
 	tOption := anytls.ClientConfig{
 		Password:                 option.Password,
 		Server:                   M.ParseSocksaddrHostPort(option.Server, uint16(option.Port)),
-		Dialer:                   singDialer,
+		Dialer:                   sessionDialer,
 		ClientMetadata:           option.ClientMetadata,
 		IdleSessionCheckInterval: time.Duration(option.IdleSessionCheckInterval) * time.Second,
 		IdleSessionTimeout:       time.Duration(option.IdleSessionTimeout) * time.Second,
 		MinIdleSession:           option.MinIdleSession,
 		DisableReuse:             option.DisableReuse,
+		SkipTLS:                  skipAnyTLSTLS,
 	}
 	echConfig, err := option.ECHOpts.Parse()
 	if err != nil {

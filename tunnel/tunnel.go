@@ -77,6 +77,17 @@ var _ C.Tunnel = Tunnel
 var _ P.Tunnel = Tunnel
 var _ proxydialer.Tunnel = Tunnel
 
+func init() {
+	statistic.IsDirectFunc = func(name string) bool {
+		configMux.RLock()
+		defer configMux.RUnlock()
+		if proxy, ok := proxies[name]; ok {
+			return proxy.Type() == C.Direct
+		}
+		return false
+	}
+}
+
 func (t tunnel) HandleTCPConn(conn net.Conn, metadata *C.Metadata) {
 	connCtx := icontext.NewConnContext(conn, metadata)
 	handleTCPConn(connCtx)
@@ -231,7 +242,6 @@ func UpdateProxies(newProxies map[string]C.Proxy, newProviders map[string]P.Prox
 	configMux.Lock()
 	proxies = newProxies
 	providers = newProviders
-	invalidateAllProxies()
 	configMux.Unlock()
 }
 
@@ -337,7 +347,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 	helper := C.RuleMatchHelper{
 		ResolveIP: func() {
 			if !resolved && metadata.Host != "" && !metadata.Resolved() {
-				ctx, cancel := context.WithTimeout(resolver.WithInitiator(context.Background(), resolver.InitiatorRule), resolver.DefaultDNSTimeout)
+				ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
 				defer cancel()
 				ip, err := resolver.ResolveIP(ctx, metadata.Host)
 				if err != nil {
@@ -438,6 +448,12 @@ func handleUDPConn(packet C.PacketAdapter) {
 		return
 	}
 
+	if shouldRejectIPv6UDP(metadata) {
+		log.Debugln("[UDP] reject IPv6 packet to %s while IPv6 is disabled", metadata.DstIP)
+		rejectIPv6UDP(packet)
+		return
+	}
+
 	key := packet.Key()
 	sender, loaded := natTable.GetOrCreate(key, func() C.PacketSender {
 		sender := newPacketSender()
@@ -462,6 +478,21 @@ func handleUDPConn(packet C.PacketAdapter) {
 			if err != nil {
 				log.Warnln("[UDP] Parse metadata failed: %s", err.Error())
 				return nil, nil, err
+			}
+
+			target := proxy
+			for a := proxy; a != nil; a = a.Unwrap(metadata, false) {
+				target = a
+			}
+			if target.Type() == C.Reject {
+				if rejector, ok := packet.(C.PacketRejector); ok {
+					_ = rejector.Reject()
+				}
+				logMetadataProxy(metadata, rule, proxy)
+				return nil, nil, errors.New("rejected")
+			} else if target.Type() == C.RejectDrop {
+				logMetadataProxy(metadata, rule, proxy)
+				return nil, nil, errors.New("reject dropped")
 			}
 
 			dialMetadata := metadata.Pure()
@@ -649,6 +680,26 @@ func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
 		log.Infoln("[%s] %s --> %s using DIRECT", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
 	default:
 		log.Infoln("[%s] %s --> %s doesn't match any rule using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String())
+	}
+}
+
+func logMetadataProxy(metadata *C.Metadata, rule C.Rule, proxy C.Proxy) {
+	name := proxy.Name()
+	switch {
+	case metadata.SpecialProxy != "":
+		log.Infoln("[%s] %s --> %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), name)
+	case rule != nil:
+		if rule.Payload() != "" {
+			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), fmt.Sprintf("%s(%s)", rule.RuleType().String(), rule.Payload()), name)
+		} else {
+			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), rule.RuleType().String(), name)
+		}
+	case mode == Global:
+		log.Infoln("[%s] %s --> %s using GLOBAL", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
+	case mode == Direct:
+		log.Infoln("[%s] %s --> %s using DIRECT", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
+	default:
+		log.Infoln("[%s] %s --> %s doesn't match any rule using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), name)
 	}
 }
 

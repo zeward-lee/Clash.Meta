@@ -139,13 +139,13 @@ func (r *Reader) WriteTo(w io.Writer) (n int64, err error) {
 //	[..]   AES-CTR(SOCKS address of the first target)
 //	[..]   AES-CTR(payload)
 //
-// Server to client (reconstructed; see the report's 联调 list):
+// Server to client (reconstructed; the three layouts the two client
+// implementations disagree on are all accepted, see handshake.go):
 //
 //	[128]  forged prefix
 //	[16]   the same token, echoed back (mismatch => ErrInvalidToken)
-//	[1]    length N of the server preamble (padding in the vendor build)
-//	[N]    preamble bytes, not used by the client
-//	[1]    IV length
+//	[..]   preamble: [1]N[N], or an hmac sized echo followed by <=10 pad bytes
+//	[1]    IV length, 0x10 for AES-CTR
 //	[IV]   read IV
 //
 // The header and the destination form one write: the vendor server starts
@@ -205,31 +205,19 @@ func (c *Conn) initReader() error {
 			return ErrInvalidToken
 		}
 	}
-	// The server preamble is length prefixed so the client does not need to
-	// know how much padding it chose.
-	preambleLen, err := readLengthByte(c.Conn)
+	// The server preamble (length prefixed padding, and in the second generation
+	// layout an hmac echo) sits between the token and the IV length byte.
+	// resolveServerPreamble accepts every known layout and returns a reader
+	// positioned right after the IV length byte.
+	reader, preamble, _, err := resolveServerPreamble(c.Conn, len(c.hmac), c.IVSize())
 	if err != nil {
-		return err
+		return fmt.Errorf("xhttp: server preamble (%s): %w", describePreamble(preamble), err)
 	}
-	if preambleLen > 0 {
-		if _, err := io.CopyN(io.Discard, c.Conn, int64(preambleLen)); err != nil {
-			return err
-		}
+	iv := make([]byte, c.IVSize())
+	if _, err := io.ReadFull(reader, iv); err != nil {
+		return fmt.Errorf("xhttp: read server IV: %w", err)
 	}
-	ivLenByte, err := readLengthByte(c.Conn)
-	if err != nil {
-		return err
-	}
-	// readLengthByte returns a byte while IVSize returns an int: widen once so
-	// the comparison, the error text and ObtainReadIV share a single type.
-	ivLen := int(ivLenByte)
-	if ivLen != c.IVSize() {
-		return fmt.Errorf("xhttp: unexpected read IV length %d (want %d)", ivLen, c.IVSize())
-	}
-	iv, err := c.ObtainReadIV(ivLen)
-	if err != nil {
-		return err
-	}
+	c.readIV = iv
 	c.r = NewReader(c.Conn, c.Decrypter(iv))
 	return nil
 }
